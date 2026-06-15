@@ -278,6 +278,11 @@ class PageCanvas(QWidget):
         ppw, pph = self.paper_size_px()
         return (pw / ppw) * page.width(), (ph / pph) * page.height()
 
+    def item_widget_rect(self, item):
+        px, py = self.to_widget_coords(item.x, item.y)
+        pw, ph = self.to_widget_size(item.w, item.h)
+        return QRectF(px, py, pw, ph)
+
     def add_image_path(self, path):
         pil = Image.open(path)
         w, h = pil.size
