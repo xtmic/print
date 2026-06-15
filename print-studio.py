@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-Print Studio - GUI программа для печати с гибкими настройками
-Поддержка HP, Epson и других принтеров через CUPS
+Print Studio v2 — GUI c редактором страниц и печатью
 """
 
 import sys
 import os
-import subprocess
+import math
 import tempfile
 from pathlib import Path
+from dataclasses import dataclass, field
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QSpinBox, QCheckBox, QGroupBox,
-    QFileDialog, QMessageBox, QTabWidget, QFormLayout, QListWidget,
-    QListWidgetItem, QSlider, QRadioButton, QButtonGroup, QProgressBar,
-    QTextEdit, QSplitter, QFrame, QScrollArea, QGridLayout
+    QFileDialog, QMessageBox, QFormLayout, QSlider, QSplitter,
+    QListWidget, QListWidgetItem, QScrollArea, QToolBar, QToolButton,
+    QSizePolicy, QColorDialog
 )
-from PySide6.QtCore import Qt, QSize, Signal, Slot, QThread
-from PySide6.QtGui import QPixmap, QImage, QFont, QIcon
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, Slot, QThread, QTimer
+from PySide6.QtGui import (
+    QPixmap, QImage, QFont, QPainter, QPen, QBrush, QColor,
+    QTransform, QPainterPath, QImageReader
+)
 
 try:
     import cups
@@ -27,617 +30,863 @@ except ImportError:
     HAS_CUPS = False
 
 try:
-    from PIL import Image, ImageQt
+    from PIL import Image, ImageQt, ImageEnhance
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
 
-
-PAPER_SIZES = [
-    "A4", "A3", "A5", "Letter", "Legal", "Tabloid",
-    "Envelope", "Executive", "B5", "C5"
-]
-
-QUALITY_PRESETS = {
-    3: "Черновик ( draft)",
-    4: "Нормальное (normal)",
-    5: "Высокое (high)",
+PAPER_SIZES = ["A4", "A3", "A5", "Letter", "Legal", "Tabloid", "B5", "C5"]
+PAPER_MM = {
+    "A4": (210, 297), "A3": (297, 420), "A5": (148, 210),
+    "Letter": (216, 279), "Legal": (216, 356), "Tabloid": (279, 432),
+    "B5": (176, 250), "C5": (162, 229),
 }
+QUALITY_PRESETS = {3: "Черновик", 4: "Нормальное", 5: "Высокое"}
+COLOR_MODES = {"color": "Цветная", "grayscale": "Ч/б"}
+DUPLEX_MODES = {"none": "Нет", "duplex": "Двустор."}
+ORIENTATIONS = {3: "Портрет", 4: "Ландшафт"}
 
-COLOR_MODES = {
-    "color": "Цветная",
-    "grayscale": "Чёрно-белая",
-}
-
-DUPLEX_MODES = {
-    "none": "Нет",
-    "duplex": "Двусторонняя",
-}
-
-ORIENTATIONS = {
-    3: "Портрет",
-    4: "Ландшафт",
-}
-
-SCALING_OPTIONS = [
-    "По размеру страницы", "По ширине", "По высоте",
-    "Вручную (%)", "Без масштабирования"
-]
+HANDLE_SIZE = 10
+MIN_ITEM_SIZE = 20
 
 
-class DriverInstaller(QThread):
-    progress = Signal(str)
-    finished = Signal(bool, str)
-    output = Signal(str)
+@dataclass
+class ImageItem:
+    path: str
+    x: float = 0
+    y: float = 0
+    w: float = 200
+    h: float = 200
+    rotation: float = 0
+    crop_l: float = 0.0
+    crop_t: float = 0.0
+    crop_r: float = 1.0
+    crop_b: float = 1.0
+    visible: bool = True
+    z: int = 0
 
-    def run(self):
-        try:
-            pkgs = []
+    def copy(self):
+        return ImageItem(self.path, self.x, self.y, self.w, self.h,
+                         self.rotation, self.crop_l, self.crop_t,
+                         self.crop_r, self.crop_b, self.visible, self.z)
 
-            self.progress.emit("Проверка пакетов...")
+    def crop_rect(self):
+        return (min(self.crop_l, self.crop_r), min(self.crop_t, self.crop_b),
+                max(self.crop_l, self.crop_r), max(self.crop_t, self.crop_b))
 
-            # HP драйверы
-            self.output.emit("> HP: hplip, hplip-gui, hpijs-ppds")
-            pkgs.extend(["hplip", "hplip-gui", "hpijs-ppds",
-                         "printer-driver-hpijs"])
 
-            # Epson драйверы
-            self.output.emit("> Epson: epson-inkjet-printer-escpr, epson-printer-utility")
-            pkgs.extend(["epson-inkjet-printer-escpr",
-                         "printer-driver-escpr"])
+class PageCanvas(QWidget):
+    item_changed = Signal()
+    item_selected = Signal(object)
 
-            # Общие драйверы
-            self.output.emit("> Gutenprint, CUPS, cups-filters")
-            pkgs.extend(["cups", "cups-filters", "cups-backend-driver",
-                         "foomatic-db", "foomatic-db-engine",
-                         "foomatic-db-hpijs", "gutenprint",
-                         "printer-driver-gutenprint"])
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(500, 600)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
 
-            # Python CUPS биндинг
-            self.output.emit("> python3-cups")
-            pkgs.append("python3-cups")
+        self.paper = "A4"
+        self.items: list[ImageItem] = []
+        self.selected_idx = -1
+        self.dragging = False
+        self.resizing = False
+        self.rotating = False
+        self.cropping = False
+        self.drag_start = QPointF()
+        self.item_start = None
+        self.handle_pos = -1
+        self.hover_handle = -1
+        self.margin = 30
+        self.bg_color = QColor(255, 255, 255)
+        self.dpi = 96
 
-            pkgs_str = " ".join(pkgs)
+    def paper_size_px(self):
+        pw, ph = PAPER_MM.get(self.paper, (210, 297))
+        return pw * self.dpi / 25.4, ph * self.dpi / 25.4
 
-            if os.geteuid() != 0:
-                self.output.emit("\n⚠ Требуются права root. Запускаю sudo apt install...\n")
+    def page_rect(self):
+        pw, ph = self.paper_size_px()
+        cw = self.width() - 2 * self.margin
+        ch = self.height() - 2 * self.margin
+        scale = min(cw / pw, ch / ph)
+        w = pw * scale
+        h = ph * scale
+        x = (self.width() - w) / 2
+        y = (self.height() - h) / 2
+        return QRectF(x, y, w, h)
 
-            cmd = f"apt-get install -y {pkgs_str}"
-            self.output.emit(f"$ sudo {cmd}\n")
+    def to_page_coords(self, pos):
+        page = self.page_rect()
+        pw, ph = self.paper_size_px()
+        sx = (pos.x() - page.x()) / page.width()
+        sy = (pos.y() - page.y()) / page.height()
+        return sx * pw, sy * ph
 
-            proc = subprocess.Popen(
-                ["sudo", "bash", "-c", cmd],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
+    def to_widget_coords(self, px, py):
+        page = self.page_rect()
+        pw, ph = self.paper_size_px()
+        wx = page.x() + (px / pw) * page.width()
+        wy = page.y() + (py / ph) * page.height()
+        return wx, wy
 
-            for line in proc.stdout:
-                line = line.strip()
-                if line:
-                    self.output.emit(line)
+    def to_widget_size(self, pw, ph):
+        page = self.page_rect()
+        ppw, pph = self.paper_size_px()
+        return (pw / ppw) * page.width(), (ph / pph) * page.height()
 
-            proc.wait()
+    def item_widget_rect(self, item):
+        px, py = self.to_widget_coords(item.x, item.y)
+        pw, ph = self.to_widget_size(item.w, item.h)
+        return QRectF(px, py, pw, ph)
 
-            if proc.returncode == 0:
-                self.finished.emit(True, "Драйверы успешно установлены!")
+    def add_item(self, path):
+        pil = Image.open(path)
+        w, h = pil.size
+        pw, ph = self.paper_size_px()
+        scale = 0.5
+        nw = w * scale
+        nh = h * scale
+        if nw > pw * 0.9:
+            s2 = pw * 0.9 / nw
+            nw *= s2
+            nh *= s2
+        if nh > ph * 0.9:
+            s2 = ph * 0.9 / nh
+            nw *= s2
+            nh *= s2
+        item = ImageItem(
+            path=path,
+            x=(pw - nw) / 2,
+            y=(ph - nh) / 2,
+            w=nw,
+            h=nh,
+            z=len(self.items)
+        )
+        self.items.append(item)
+        self.selected_idx = len(self.items) - 1
+        self.item_changed.emit()
+        self.item_selected.emit(item)
+        self.update()
+
+    def delete_selected(self):
+        if 0 <= self.selected_idx < len(self.items):
+            del self.items[self.selected_idx]
+            self.selected_idx = min(self.selected_idx, len(self.items) - 1)
+            self.item_changed.emit()
+            self.item_selected.emit(self.items[self.selected_idx] if self.selected_idx >= 0 else None)
+            self.update()
+
+    def move_selected_up(self):
+        if 0 <= self.selected_idx < len(self.items):
+            item = self.items[self.selected_idx]
+            item.z += 1
+            for it in self.items:
+                if it is not item and it.z >= item.z:
+                    it.z -= 1
+            self.item_changed.emit()
+            self.update()
+
+    def move_selected_down(self):
+        if 0 <= self.selected_idx < len(self.items):
+            item = self.items[self.selected_idx]
+            item.z -= 1
+            for it in self.items:
+                if it is not item and it.z <= item.z:
+                    it.z += 1
+            self.item_changed.emit()
+            self.update()
+
+    def rotate_selected(self, deg):
+        if 0 <= self.selected_idx < len(self.items):
+            self.items[self.selected_idx].rotation = (self.items[self.selected_idx].rotation + deg) % 360
+            self.item_changed.emit()
+            self.update()
+
+    def flip_selected_h(self):
+        if 0 <= self.selected_idx < len(self.items):
+            item = self.items[self.selected_idx]
+            item.crop_l, item.crop_r = item.crop_r, item.crop_l
+            self.item_changed.emit()
+            self.update()
+
+    def flip_selected_v(self):
+        if 0 <= self.selected_idx < len(self.items):
+            item = self.items[self.selected_idx]
+            item.crop_t, item.crop_b = item.crop_b, item.crop_t
+            self.item_changed.emit()
+            self.update()
+
+    def reset_crop(self):
+        if 0 <= self.selected_idx < len(self.items):
+            item = self.items[self.selected_idx]
+            item.crop_l = 0
+            item.crop_t = 0
+            item.crop_r = 1
+            item.crop_b = 1
+            r = item.rotation
+            item.rotation = 0
+            pil = Image.open(item.path)
+            nw, nh = item.w, item.h
+            if r in (90, 270):
+                ratio = pil.height / pil.width
             else:
-                self.finished.emit(False, f"Ошибка установки (код: {proc.returncode})")
+                ratio = pil.height / pil.width
+            nh = nw * ratio
+            item.h = nh
+            self.item_changed.emit()
+            self.update()
 
-        except Exception as e:
-            self.finished.emit(False, str(e))
+    def find_item_at(self, pos):
+        px, py = self.to_page_coords(pos)
+        best = -1
+        best_z = -999999
+        for i, item in enumerate(self.items):
+            if not item.visible:
+                continue
+            if item.x <= px <= item.x + item.w and item.y <= py <= item.y + item.h:
+                if item.z > best_z:
+                    best_z = item.z
+                    best = i
+        return best
+
+    def get_handles(self, item):
+        rect = self.item_widget_rect(item)
+        c = rect.center()
+        handles = {
+            0: rect.topLeft(),
+            1: rect.topRight(),
+            2: rect.bottomRight(),
+            3: rect.bottomLeft(),
+            4: QPointF((rect.left() + rect.right()) / 2, rect.top()),
+            5: QPointF((rect.left() + rect.right()) / 2, rect.bottom()),
+            6: QPointF(rect.left(), (rect.top() + rect.bottom()) / 2),
+            7: QPointF(rect.right(), (rect.top() + rect.bottom()) / 2),
+            8: QPointF(c.x(), rect.top() - 30),
+        }
+        return handles
+
+    def hit_test_handle(self, pos):
+        if self.selected_idx < 0:
+            return -1
+        handles = self.get_handles(self.items[self.selected_idx])
+        for idx, pt in handles.items():
+            if abs(pos.x() - pt.x()) < HANDLE_SIZE and abs(pos.y() - pt.y()) < HANDLE_SIZE:
+                return idx
+        return -1
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            h = self.hit_test_handle(event.position())
+            if h >= 0:
+                self.handle_pos = h
+                if h == 8:
+                    self.rotating = True
+                else:
+                    self.resizing = True
+                self.drag_start = event.position()
+                self.item_start = self.items[self.selected_idx].copy()
+                return
+
+            idx = self.find_item_at(event.position())
+            if idx >= 0:
+                self.selected_idx = idx
+                self.item_selected.emit(self.items[idx])
+                self.dragging = True
+                self.drag_start = event.position()
+                self.item_start = self.items[idx].copy()
+            else:
+                self.selected_idx = -1
+                self.item_selected.emit(None)
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+
+        if self.dragging and self.item_start:
+            page = self.page_rect()
+            pw, ph = self.paper_size_px()
+            dx = (pos.x() - self.drag_start.x()) / page.width() * pw
+            dy = (pos.y() - self.drag_start.y()) / page.height() * ph
+            item = self.items[self.selected_idx]
+            item.x = max(0, min(pw - item.w, self.item_start.x + dx))
+            item.y = max(0, min(ph - item.h, self.item_start.y + dy))
+            self.item_changed.emit()
+            self.update()
+
+        elif self.resizing and self.item_start:
+            px, py = self.to_page_coords(pos)
+            item = self.items[self.selected_idx]
+            start = self.item_start
+
+            if self.handle_pos in (0, 3, 6):
+                nx = min(px, start.x + start.w - MIN_ITEM_SIZE)
+                nw = start.x + start.w - nx
+                item.x = max(0, nx)
+                item.w = max(MIN_ITEM_SIZE, nw)
+            elif self.handle_pos in (1, 2, 7):
+                item.w = max(MIN_ITEM_SIZE, px - start.x)
+            if self.handle_pos in (0, 1, 4):
+                ny = min(py, start.y + start.h - MIN_ITEM_SIZE)
+                nh2 = start.y + start.h - ny
+                item.y = max(0, ny)
+                item.h = max(MIN_ITEM_SIZE, nh2)
+            elif self.handle_pos in (2, 3, 5):
+                item.h = max(MIN_ITEM_SIZE, py - start.y)
+
+            self.item_changed.emit()
+            self.update()
+
+        elif self.rotating and self.item_start:
+            cw, cy = self.to_widget_coords(
+                self.items[self.selected_idx].x + self.items[self.selected_idx].w / 2,
+                self.items[self.selected_idx].y + self.items[self.selected_idx].h / 2
+            )
+            item = self.items[self.selected_idx]
+            angle = math.degrees(math.atan2(pos.x() - cw, - (pos.y() - cy)))
+            item.rotation = angle
+            self.item_changed.emit()
+            self.update()
+
+        else:
+            self.hover_handle = self.hit_test_handle(pos)
+            if self.hover_handle >= 0 or self.find_item_at(pos) >= 0:
+                self.setCursor(Qt.OpenHandCursor if self.hover_handle < 0 else Qt.CrossCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+
+    def mouseReleaseEvent(self, event):
+        self.dragging = False
+        self.resizing = False
+        self.rotating = False
+        self.item_start = None
+        self.handle_pos = -1
+        self.setCursor(Qt.ArrowCursor)
+
+    def wheelEvent(self, event):
+        if self.selected_idx >= 0 and event.modifiers() & Qt.ControlModifier:
+            delta = event.angleDelta().y() / 120.0
+            item = self.items[self.selected_idx]
+            scale = 1.0 + delta * 0.05
+            cx = item.x + item.w / 2
+            cy = item.y + item.h / 2
+            item.w *= scale
+            item.h *= scale
+            item.x = cx - item.w / 2
+            item.y = cy - item.h / 2
+            self.item_changed.emit()
+            self.update()
+
+    def draw_page_bg(self, painter):
+        page = self.page_rect()
+        painter.setPen(QPen(QColor(100, 100, 100), 2))
+        painter.setBrush(QBrush(self.bg_color))
+        painter.drawRect(page)
+
+    def load_pil_image(self, item):
+        try:
+            img = Image.open(item.path)
+            if img.mode == 'RGBA':
+                bg = Image.new('RGBA', img.size, (255, 255, 255, 255))
+                img = Image.alpha_composite(bg, img)
+            elif img.mode != 'RGB' and img.mode != 'RGBA':
+                img = img.convert('RGBA')
+            return img
+        except Exception:
+            return None
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        page = self.page_rect()
+        self.draw_page_bg(painter)
+        painter.setClipRect(page)
+
+        sorted_items = sorted(self.items, key=lambda it: it.z)
+
+        for i, item in enumerate(sorted_items):
+            if not item.visible or not HAS_PIL:
+                continue
+
+            pil = self.load_pil_image(item)
+            if pil is None:
+                continue
+
+            cl, ct, cr, cb = item.crop_rect()
+            ow, oh = pil.size
+            cx1 = int(cl * ow)
+            cy1 = int(ct * oh)
+            cx2 = int(cr * ow)
+            cy2 = int(cb * oh)
+            if cx2 <= cx1 or cy2 <= cy1:
+                continue
+            cropped = pil.crop((cx1, cy1, cx2, cy2))
+
+            qimg = ImageQt.ImageQt(cropped)
+            pixmap = QPixmap.fromImage(qimg)
+
+            rect = self.item_widget_rect(item)
+            painter.save()
+            painter.translate(rect.center())
+
+            if item.rotation != 0:
+                painter.rotate(item.rotation)
+
+            target = QRectF(-rect.width() / 2, -rect.height() / 2,
+                            rect.width(), rect.height())
+            painter.drawPixmap(target.toRect(), pixmap)
+
+            if item is self.items[self.selected_idx]:
+                painter.setPen(QPen(QColor(0, 120, 255), 2, Qt.DashLine))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(target)
+
+            painter.restore()
+
+        painter.setClipRect(QRectF(0, 0, self.width(), self.height()))
+
+        if self.selected_idx >= 0 and self.selected_idx < len(self.items):
+            item = self.items[self.selected_idx]
+            handles = self.get_handles(item)
+            for idx, pt in handles.items():
+                if idx == 8:
+                    painter.setPen(QPen(QColor(0, 120, 255), 2))
+                    cw, cy = self.to_widget_coords(
+                        item.x + item.w / 2, item.y + item.h / 2)
+                    painter.drawLine(QPointF(int(cw), int(cy)), pt)
+                painter.setBrush(QBrush(QColor(0, 120, 255)))
+                painter.setPen(QPen(Qt.white, 1))
+                painter.drawRect(QRectF(pt.x() - 5, pt.y() - 5, 10, 10))
+
+        painter.end()
+
+    def page_to_image(self):
+        if not HAS_PIL:
+            return None
+        pw, ph = self.paper_size_px()
+        img = Image.new('RGB', (int(pw), int(ph)),
+                        (self.bg_color.red(), self.bg_color.green(), self.bg_color.blue()))
+        sorted_items = sorted(self.items, key=lambda it: it.z)
+        for item in sorted_items:
+            if not item.visible:
+                continue
+            pil = self.load_pil_image(item)
+            if pil is None:
+                continue
+            cl, ct, cr, cb = item.crop_rect()
+            ow, oh = pil.size
+            cx1 = max(0, int(cl * ow))
+            cy1 = max(0, int(ct * oh))
+            cx2 = min(ow, int(cr * ow))
+            cy2 = min(oh, int(cb * oh))
+            if cx2 <= cx1 or cy2 <= cy1:
+                continue
+            cropped = pil.crop((cx1, cy1, cx2, cy2))
+            cropped = cropped.resize((max(1, int(item.w)), max(1, int(item.h))),
+                                     Image.LANCZOS)
+            if item.rotation != 0:
+                cropped = cropped.rotate(item.rotation, expand=True, resample=Image.BICUBIC,
+                                        fillcolor=(255, 255, 255, 0))
+            if cropped.mode == 'RGBA':
+                mask = cropped.split()[3]
+                img.paste(cropped, (max(0, int(item.x)), max(0, int(item.y))), mask)
+            else:
+                img.paste(cropped, (max(0, int(item.x)), max(0, int(item.y))))
+        return img
+
+    def clear_page(self):
+        self.items = []
+        self.selected_idx = -1
+        self.item_changed.emit()
+        self.item_selected.emit(None)
+        self.update()
 
 
 class PrintWorker(QThread):
     progress = Signal(str)
     finished = Signal(bool, str)
-    page_printed = Signal(int)
 
-    def __init__(self, conn, printer_name, file_path, options, copies):
+    def __init__(self, conn, printer_name, page_images, options, copies):
         super().__init__()
         self.conn = conn
         self.printer_name = printer_name
-        self.file_path = file_path
+        self.page_images = page_images
         self.options = options
         self.copies = copies
 
     def run(self):
         try:
-            for i in range(self.copies):
-                self.progress.emit(f"Печать копии {i+1}/{self.copies}...")
-                job_id = self.conn.printFile(
-                    self.printer_name,
-                    self.file_path,
-                    Path(self.file_path).name,
-                    self.options
-                )
-                self.page_printed.emit(i + 1)
+            tmpdir = tempfile.mkdtemp(prefix="printstudio_")
+            files = []
+            for i, img in enumerate(self.page_images):
+                fpath = os.path.join(tmpdir, f"page_{i+1}.png")
+                img.save(fpath, "PNG")
+                files.append(fpath)
 
-            self.finished.emit(True, f"Отправлено на печать ({self.copies} копий)")
+            for ci in range(self.copies):
+                self.progress.emit(f"Копия {ci+1}/{self.copies}...")
+                for fi, fpath in enumerate(files):
+                    self.conn.printFile(
+                        self.printer_name, fpath,
+                        f"page_{fi+1}", self.options
+                    )
+
+            for f in files:
+                os.unlink(f)
+            os.rmdir(tmpdir)
+            self.finished.emit(True, f"Отправлено ({len(files)} стр., {self.copies} копий)")
         except Exception as e:
             self.finished.emit(False, str(e))
-
-
-class PrintPreview(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setup_ui()
-
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
-        self.preview_label = QLabel("Предпросмотр")
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(400, 500)
-        self.preview_label.setStyleSheet("""
-            QLabel {
-                background-color: #f0f0f0;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                padding: 10px;
-            }
-        """)
-        layout.addWidget(self.preview_label)
-
-    def show_preview(self, file_path):
-        if not HAS_PIL:
-            self.preview_label.setText("PIL не установлен\nУстановите: pip install Pillow")
-            return
-
-        try:
-            img = Image.open(file_path)
-
-            if img.mode == 'RGBA':
-                bg = Image.new('RGB', img.size, (255, 255, 255))
-                bg.paste(img, mask=img.split()[3])
-                img = bg
-            elif img.mode != 'RGB':
-                img = img.convert('RGB')
-
-            preview_size = (380, 480)
-            img.thumbnail(preview_size, Image.LANCZOS)
-
-            qimg = ImageQt.ImageQt(img)
-            pixmap = QPixmap.fromImage(qimg)
-
-            self.preview_label.setPixmap(pixmap)
-
-        except Exception as e:
-            self.preview_label.setText(f"Ошибка предпросмотра:\n{str(e)}")
 
 
 class PrintStudio(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Print Studio")
-        self.setMinimumSize(900, 700)
-
+        self.setWindowTitle("Print Studio v2")
+        self.setMinimumSize(1100, 750)
         self.conn = None
-        self.selected_file = None
         self.printer_attrs = {}
+        self.page_idx = 0
+        self.pages = [PageCanvas()]
 
         self.setup_ui()
         self.connect_cups()
+        self.current_page().item_changed.connect(self.on_item_changed)
+
+    def current_page(self):
+        return self.pages[self.page_idx]
 
     def setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Левая панель - настройки
+        # === ЛЕВАЯ ПАНЕЛЬ ===
         left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_panel.setMaximumWidth(450)
+        left_panel.setMaximumWidth(360)
+        left = QVBoxLayout(left_panel)
+        left.setContentsMargins(8, 8, 8, 8)
 
-        # Выбор файла
-        file_group = QGroupBox("Файл для печати")
-        file_layout = QVBoxLayout(file_group)
-        file_btn_layout = QHBoxLayout()
-        self.file_btn = QPushButton("Выбрать файл...")
-        self.file_btn.clicked.connect(self.select_file)
-        self.file_label = QLabel("Файл не выбран")
-        file_btn_layout.addWidget(self.file_btn)
-        file_btn_layout.addWidget(self.file_label, 1)
-        file_layout.addLayout(file_btn_layout)
-        left_layout.addWidget(file_group)
+        # Файлы
+        files_grp = QGroupBox("Изображения")
+        fl = QVBoxLayout(files_grp)
+        btn_row = QHBoxLayout()
+        self.add_btn = QPushButton("Добавить")
+        self.add_btn.clicked.connect(self.add_image)
+        self.add_multi_btn = QPushButton("+Несколько")
+        self.add_multi_btn.clicked.connect(self.add_images)
+        btn_row.addWidget(self.add_btn)
+        btn_row.addWidget(self.add_multi_btn)
+        fl.addLayout(btn_row)
+        self.delete_img_btn = QPushButton("Удалить")
+        self.delete_img_btn.clicked.connect(self.current_page().delete_selected)
+        fl.addWidget(self.delete_img_btn)
+        left.addWidget(files_grp)
 
-        # Выбор принтера
-        printer_group = QGroupBox("Принтер")
-        printer_layout = QVBoxLayout(printer_group)
-        printer_row = QHBoxLayout()
+        # Слой
+        layer_grp = QGroupBox("Слой")
+        ll = QVBoxLayout(layer_grp)
+        lr1 = QHBoxLayout()
+        self.up_btn = QPushButton("▲")
+        self.up_btn.clicked.connect(self.current_page().move_selected_up)
+        self.down_btn = QPushButton("▼")
+        self.down_btn.clicked.connect(self.current_page().move_selected_down)
+        lr1.addWidget(self.up_btn)
+        lr1.addWidget(self.down_btn)
+        ll.addLayout(lr1)
+        lr2 = QHBoxLayout()
+        self.rot_l_btn = QPushButton("↺ -90")
+        self.rot_l_btn.clicked.connect(lambda: self.current_page().rotate_selected(-90))
+        self.rot_r_btn = QPushButton("↻ +90")
+        self.rot_r_btn.clicked.connect(lambda: self.current_page().rotate_selected(90))
+        lr2.addWidget(self.rot_l_btn)
+        lr2.addWidget(self.rot_r_btn)
+        ll.addLayout(lr2)
+        lr3 = QHBoxLayout()
+        self.flip_h_btn = QPushButton("↔ Гор.")
+        self.flip_h_btn.clicked.connect(self.current_page().flip_selected_h)
+        self.flip_v_btn = QPushButton("↕ Верт.")
+        self.flip_v_btn.clicked.connect(self.current_page().flip_selected_v)
+        lr3.addWidget(self.flip_h_btn)
+        lr3.addWidget(self.flip_v_btn)
+        ll.addLayout(lr3)
+        self.reset_crop_btn = QPushButton("Сброс обрезки")
+        self.reset_crop_btn.clicked.connect(self.current_page().reset_crop)
+        ll.addWidget(self.reset_crop_btn)
+        left.addWidget(layer_grp)
+
+        # Страницы
+        page_grp = QGroupBox("Страницы")
+        pl = QVBoxLayout(page_grp)
+        pg_nav = QHBoxLayout()
+        self.prev_btn = QPushButton("◀")
+        self.prev_btn.clicked.connect(self.prev_page)
+        self.page_label = QLabel("1 / 1")
+        self.page_label.setAlignment(Qt.AlignCenter)
+        self.next_btn = QPushButton("▶")
+        self.next_btn.clicked.connect(self.next_page)
+        pg_nav.addWidget(self.prev_btn)
+        pg_nav.addWidget(self.page_label)
+        pg_nav.addWidget(self.next_btn)
+        pl.addLayout(pg_nav)
+        pg_nav2 = QHBoxLayout()
+        self.add_page_btn = QPushButton("+ Страница")
+        self.add_page_btn.clicked.connect(self.add_page)
+        self.del_page_btn = QPushButton("− Страница")
+        self.del_page_btn.clicked.connect(self.delete_page)
+        pg_nav2.addWidget(self.add_page_btn)
+        pg_nav2.addWidget(self.del_page_btn)
+        pl.addLayout(pg_nav2)
+        self.dup_page_btn = QPushButton("Копировать страницу")
+        self.dup_page_btn.clicked.connect(self.duplicate_page)
+        pl.addWidget(self.dup_page_btn)
+        left.addWidget(page_grp)
+
+        # Принтер
+        printer_grp = QGroupBox("Принтер")
+        prl = QVBoxLayout(printer_grp)
+        prr = QHBoxLayout()
         self.printer_combo = QComboBox()
-        self.printer_combo.currentIndexChanged.connect(self.on_printer_changed)
-        self.refresh_btn = QPushButton("🔄")
-        self.refresh_btn.setToolTip("Обновить список принтеров")
+        self.refresh_btn = QPushButton("↻")
         self.refresh_btn.clicked.connect(self.refresh_printers)
-        printer_row.addWidget(self.printer_combo, 1)
-        printer_row.addWidget(self.refresh_btn)
-        printer_layout.addLayout(printer_row)
-        left_layout.addWidget(printer_group)
+        prr.addWidget(self.printer_combo, 1)
+        prr.addWidget(self.refresh_btn)
+        prl.addLayout(prr)
+        left.addWidget(printer_grp)
 
-        # Настройки печати
-        settings_group = QGroupBox("Настройки печати")
-        settings_layout = QFormLayout(settings_group)
-
-        # Количество копий
+        # Настройки
+        set_grp = QGroupBox("Печать")
+        sl = QFormLayout(set_grp)
         self.copies_spin = QSpinBox()
         self.copies_spin.setRange(1, 999)
         self.copies_spin.setValue(1)
-        settings_layout.addRow("Копии:", self.copies_spin)
+        sl.addRow("Копии:", self.copies_spin)
 
-        # Ориентация
-        self.orientation_combo = QComboBox()
+        self.orient_combo = QComboBox()
         for k, v in ORIENTATIONS.items():
-            self.orientation_combo.addItem(v, k)
-        settings_layout.addRow("Ориентация:", self.orientation_combo)
+            self.orient_combo.addItem(v, k)
+        sl.addRow("Ориентация:", self.orient_combo)
 
-        # Размер бумаги
         self.paper_combo = QComboBox()
         self.paper_combo.addItems(PAPER_SIZES)
         self.paper_combo.setCurrentText("A4")
-        settings_layout.addRow("Бумага:", self.paper_combo)
+        self.paper_combo.currentTextChanged.connect(self.on_paper_changed)
+        sl.addRow("Бумага:", self.paper_combo)
 
-        # Цвет
         self.color_combo = QComboBox()
         for k, v in COLOR_MODES.items():
             self.color_combo.addItem(v, k)
-        settings_layout.addRow("Цветность:", self.color_combo)
+        sl.addRow("Цвет:", self.color_combo)
 
-        # Качество
-        self.quality_combo = QComboBox()
+        self.qual_combo = QComboBox()
         for k, v in QUALITY_PRESETS.items():
-            self.quality_combo.addItem(v, k)
-        settings_layout.addRow("Качество:", self.quality_combo)
+            self.qual_combo.addItem(v, k)
+        sl.addRow("Качество:", self.qual_combo)
 
-        # Дуплекс
-        self.duplex_combo = QComboBox()
+        self.dup_combo = QComboBox()
         for k, v in DUPLEX_MODES.items():
-            self.duplex_combo.addItem(v, k)
-        settings_layout.addRow("Двусторонняя:", self.duplex_combo)
-
-        # Масштабирование
-        self.scaling_combo = QComboBox()
-        self.scaling_combo.addItems(SCALING_OPTIONS)
-        settings_layout.addRow("Масштаб:", self.scaling_combo)
-
-        # Процент масштаба (для ручного режима)
-        scale_row = QHBoxLayout()
-        self.scale_slider = QSlider(Qt.Horizontal)
-        self.scale_slider.setRange(10, 500)
-        self.scale_slider.setValue(100)
-        self.scale_slider.setEnabled(False)
-        self.scale_label = QLabel("100%")
-        self.scale_slider.valueChanged.connect(
-            lambda v: self.scale_label.setText(f"{v}%")
-        )
-        self.scaling_combo.currentTextChanged.connect(
-            lambda t: self.scale_slider.setEnabled(t == "Вручную (%)")
-        )
-        scale_row.addWidget(self.scale_slider, 1)
-        scale_row.addWidget(self.scale_label)
-        settings_layout.addRow("", scale_row)
-
-        # Количество страниц на листе
-        self.pages_per_sheet = QSpinBox()
-        self.pages_per_sheet.setRange(1, 16)
-        self.pages_per_sheet.setValue(1)
-        settings_layout.addRow("Стр./лист:", self.pages_per_sheet)
-
-        left_layout.addWidget(settings_group)
+            self.dup_combo.addItem(v, k)
+        sl.addRow("Дуплекс:", self.dup_combo)
+        left.addWidget(set_grp)
 
         # Кнопка печати
         self.print_btn = QPushButton("🖨  Напечатать")
-        self.print_btn.setMinimumHeight(50)
+        self.print_btn.setMinimumHeight(48)
         self.print_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-size: 16px;
-                font-weight: bold;
-                border-radius: 6px;
-                padding: 10px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
+            QPushButton { background-color: #4CAF50; color: white; font-size: 15px;
+            font-weight: bold; border-radius: 6px; padding: 8px; }
+            QPushButton:hover { background-color: #45a049; }
+            QPushButton:disabled { background-color: #ccc; }
         """)
-        self.print_btn.clicked.connect(self.print_file)
-        self.print_btn.setEnabled(False)
-        left_layout.addWidget(self.print_btn)
+        self.print_btn.clicked.connect(self.print_document)
+        left.addWidget(self.print_btn)
 
-        # Прогресс
-        self.progress_label = QLabel("")
-        left_layout.addWidget(self.progress_label)
+        self.status_label = QLabel("")
+        left.addWidget(self.status_label)
 
-        # Правая панель - предпросмотр + драйверы + лог
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
+        left.addStretch()
 
-        # Предпросмотр
-        self.preview = PrintPreview()
-        right_layout.addWidget(self.preview, 2)
+        # === ПРАВАЯ ЧАСТЬ: холст ===
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.page_stack = QWidget()
+        self.page_stack_layout = QVBoxLayout(self.page_stack)
+        self.page_stack_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Таб с установкой драйверов и логом
-        tabs = QTabWidget()
+        self.page_stack_layout.addWidget(self.current_page())
+        scroll.setWidget(self.page_stack)
 
-        # Вкладка драйверов
-        driver_tab = QWidget()
-        driver_layout = QVBoxLayout(driver_tab)
-
-        driver_info = QLabel(
-            "Установка драйверов для HP и Epson принтеров.\n"
-            "Требуются права root (будет запрошен пароль sudo)."
-        )
-        driver_info.setWordWrap(True)
-        driver_layout.addWidget(driver_info)
-
-        driver_btn_layout = QHBoxLayout()
-        self.install_hp_btn = QPushButton("Установить HP")
-        self.install_hp_btn.clicked.connect(lambda: self.install_drivers("hp"))
-        self.install_epson_btn = QPushButton("Установить Epson")
-        self.install_epson_btn.clicked.connect(lambda: self.install_drivers("epson"))
-        self.install_all_btn = QPushButton("Установить всё")
-        self.install_all_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FF9800;
-                color: white;
-                font-weight: bold;
-                border-radius: 4px;
-                padding: 8px;
-            }
-            QPushButton:hover { background-color: #F57C00; }
-        """)
-        self.install_all_btn.clicked.connect(lambda: self.install_drivers("all"))
-
-        driver_btn_layout.addWidget(self.install_hp_btn)
-        driver_btn_layout.addWidget(self.install_epson_btn)
-        driver_btn_layout.addWidget(self.install_all_btn)
-        driver_layout.addLayout(driver_btn_layout)
-
-        self.driver_progress = QProgressBar()
-        self.driver_progress.setVisible(False)
-        driver_layout.addWidget(self.driver_progress)
-
-        self.driver_output = QTextEdit()
-        self.driver_output.setReadOnly(True)
-        self.driver_output.setMaximumHeight(150)
-        self.driver_output.setPlaceholderText("Лог установки драйверов...")
-        driver_layout.addWidget(self.driver_output)
-
-        tabs.addTab(driver_tab, "Драйверы")
-
-        # Вкладка лога
-        log_tab = QWidget()
-        log_layout = QVBoxLayout(log_tab)
-        self.log_output = QTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setPlaceholderText("Лог печати...")
-        log_layout.addWidget(self.log_output)
-
-        tabs.addTab(log_tab, "Лог")
-
-        right_layout.addWidget(tabs, 1)
-
-        # Разделитель
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([400, 500])
+        splitter.addWidget(scroll)
+        splitter.setSizes([360, 740])
         main_layout.addWidget(splitter)
 
-    def log(self, msg):
-        self.log_output.append(msg)
+    def on_paper_changed(self, text):
+        self.current_page().paper = text
+        self.current_page().update()
 
-    def progress(self, msg):
-        self.progress_label.setText(msg)
+    def on_item_changed(self):
+        pass
+
+    def switch_page(self, idx):
+        if idx == self.page_idx:
+            return
+        old = self.current_page()
+        self.page_stack_layout.removeWidget(old)
+        old.hide()
+        old.item_changed.disconnect()
+
+        self.page_idx = idx
+        new_page = self.current_page()
+        self.page_stack_layout.addWidget(new_page)
+        new_page.show()
+        new_page.item_changed.connect(self.on_item_changed)
+        self.page_label.setText(f"{self.page_idx + 1} / {len(self.pages)}")
+
+    def prev_page(self):
+        if self.page_idx > 0:
+            self.switch_page(self.page_idx - 1)
+
+    def next_page(self):
+        if self.page_idx < len(self.pages) - 1:
+            self.switch_page(self.page_idx + 1)
+
+    def add_page(self):
+        p = PageCanvas()
+        p.paper = self.paper_combo.currentText()
+        p.item_changed.connect(self.on_item_changed)
+        self.pages.append(p)
+        self.switch_page(len(self.pages) - 1)
+        self.page_label.setText(f"{self.page_idx + 1} / {len(self.pages)}")
+
+    def delete_page(self):
+        if len(self.pages) <= 1:
+            return
+        self.page_stack_layout.removeWidget(self.current_page())
+        self.current_page().hide()
+        del self.pages[self.page_idx]
+        self.page_idx = min(self.page_idx, len(self.pages) - 1)
+        new_page = self.current_page()
+        self.page_stack_layout.addWidget(new_page)
+        new_page.show()
+        new_page.item_changed.connect(self.on_item_changed)
+        self.page_label.setText(f"{self.page_idx + 1} / {len(self.pages)}")
+
+    def duplicate_page(self):
+        src = self.current_page()
+        p = PageCanvas()
+        p.paper = src.paper
+        p.bg_color = src.bg_color
+        p.items = [it.copy() for it in src.items]
+        p.item_changed.connect(self.on_item_changed)
+        self.pages.append(p)
+        self.switch_page(len(self.pages) - 1)
+        self.page_label.setText(f"{self.page_idx + 1} / {len(self.pages)}")
+
+    def add_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите изображение", "",
+            "Изображения (*.png *.jpg *.jpeg *.bmp *.tiff *.gif *.webp);;Все (*)"
+        )
+        if path:
+            self.current_page().add_item(path)
+
+    def add_images(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Выберите изображения", "",
+            "Изображения (*.png *.jpg *.jpeg *.bmp *.tiff *.gif *.webp);;Все (*)"
+        )
+        for path in paths:
+            self.current_page().add_item(path)
 
     def connect_cups(self):
         if HAS_CUPS:
             try:
                 self.conn = cups.Connection()
-                self.log("✓ CUPS подключён")
                 self.refresh_printers()
-            except Exception as e:
-                self.log(f"✗ CUPS: {e}")
-                QMessageBox.warning(self, "CUPS",
-                    "Не удалось подключиться к CUPS.\n"
-                    "Убедитесь, что CUPS запущен:\n"
-                    "  sudo systemctl start cups\n"
-                    "Или установите: sudo apt install cups")
+            except Exception:
                 self.conn = None
         else:
-            self.log("✗ python3-cups не установлен")
-            QMessageBox.warning(self, "CUPS",
-                "python3-cups не найден.\n"
-                "Установите: pip install pycups  или  sudo apt install python3-cups")
             self.conn = None
 
     def refresh_printers(self):
-        if not self.conn:
-            return
-
         self.printer_combo.clear()
+        if not self.conn:
+            self.printer_combo.addItem("CUPS не доступен")
+            return
         try:
             printers = self.conn.getPrinters()
             if not printers:
-                self.printer_combo.addItem("— Принтеры не найдены —")
-                self.print_btn.setEnabled(False)
-                self.log("ℹ Принтеры не обнаружены")
+                self.printer_combo.addItem("— Нет принтеров —")
                 return
-
-            for name, attrs in sorted(printers.items()):
-                status = attrs.get("printer-state", 0)
-                status_map = {3: "🟢", 4: "🟡", 5: "🔴"}
-                icon = status_map.get(status, "⚪")
-                info = attrs.get("printer-info", "")
-                self.printer_combo.addItem(f"{icon} {name} ({info})", name)
-                self.printer_attrs[name] = attrs
-
-            self.print_btn.setEnabled(bool(self.selected_file))
-            self.log(f"✓ Найдено принтеров: {len(printers)}")
-
-        except Exception as e:
-            self.log(f"✗ Ошибка получения принтеров: {e}")
-
-    def on_printer_changed(self, idx):
-        if idx >= 0 and self.printer_combo.currentData():
-            name = self.printer_combo.currentData()
-            attrs = self.printer_attrs.get(name, {})
-            self.log(f"Выбран принтер: {name}")
-
-    def select_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите файл для печати", "",
-            "Изображения (*.png *.jpg *.jpeg *.bmp *.tiff *.gif);;"
-            "PDF (*.pdf);;"
-            "Все файлы (*)"
-        )
-        if file_path:
-            self.selected_file = file_path
-            self.file_label.setText(Path(file_path).name)
-            self.print_btn.setEnabled(bool(self.printer_combo.count() > 0
-                                          and self.printer_combo.currentData()))
-            self.preview.show_preview(file_path)
-            self.log(f"✓ Выбран файл: {file_path}")
+            for name in sorted(printers.keys()):
+                self.printer_combo.addItem(name, name)
+        except Exception:
+            self.printer_combo.addItem("— Ошибка —")
 
     def build_options(self):
         opts = {}
-
-        orient = self.orientation_combo.currentData()
+        orient = self.orient_combo.currentData()
         if orient:
             opts["orientation-requested"] = str(orient)
-
-        paper = self.paper_combo.currentText()
-        if paper:
-            opts["PageSize"] = paper
-
+        opts["PageSize"] = self.paper_combo.currentText()
         color = self.color_combo.currentData()
-        if color == "grayscale":
-            opts["print-color-mode"] = "monochrome"
-        else:
-            opts["print-color-mode"] = "color"
-
-        quality = self.quality_combo.currentData()
-        if quality:
-            opts["print-quality"] = str(quality)
-
-        duplex = self.duplex_combo.currentData()
-        if duplex and duplex != "none":
-            opts["sides"] = duplex
-
-        scaling = self.scaling_combo.currentText()
-        if scaling == "Вручную (%)":
-            opts["scaling"] = str(self.scale_slider.value())
-        elif scaling == "По размеру страницы":
-            opts["fit-to-page"] = "True"
-        elif scaling == "По ширине":
-            opts["fit-to-page"] = "True"
-            opts["fit-to-page"] = "True"
-        elif scaling == "Без масштабирования":
-            opts["scaling"] = "100"
-
-        pps = self.pages_per_sheet.value()
-        if pps > 1:
-            opts["number-up"] = str(pps)
-
-        opts["media-source"] = "auto"
-
+        opts["print-color-mode"] = "monochrome" if color == "grayscale" else "color"
+        qual = self.qual_combo.currentData()
+        if qual:
+            opts["print-quality"] = str(qual)
+        dup = self.dup_combo.currentData()
+        if dup and dup != "none":
+            opts["sides"] = dup
+        opts["fit-to-page"] = "True"
         return opts
 
-    def print_file(self):
+    def print_document(self):
         if not self.conn:
-            QMessageBox.warning(self, "Ошибка",
-                "CUPS не подключён. Установите драйверы и перезапустите программу.")
+            QMessageBox.warning(self, "Ошибка", "CUPS не подключён.")
+            return
+        printer = self.printer_combo.currentData()
+        if not printer:
+            QMessageBox.warning(self, "Ошибка", "Выберите принтер.")
             return
 
-        if not self.selected_file:
-            QMessageBox.warning(self, "Ошибка", "Выберите файл для печати")
-            return
+        self.status_label.setText("Подготовка страниц...")
+        QApplication.processEvents()
 
-        printer_name = self.printer_combo.currentData()
-        if not printer_name:
-            QMessageBox.warning(self, "Ошибка", "Выберите принтер")
-            return
+        page_images = []
+        for i, page in enumerate(self.pages):
+            img = page.page_to_image()
+            if img is None:
+                QMessageBox.critical(self, "Ошибка", "Pillow не установлен. pip install Pillow")
+                return
+            page_images.append(img)
 
         options = self.build_options()
         copies = self.copies_spin.value()
 
-        self.log(f"\n{'='*40}")
-        self.log(f"Печать: {Path(self.selected_file).name}")
-        self.log(f"Принтер: {printer_name}")
-        self.log(f"Копии: {copies}")
-        self.log(f"Параметры: {options}")
-        self.log(f"{'='*40}")
-
         self.print_btn.setEnabled(False)
-        self.progress_label.setText("Печать...")
-
-        self.worker = PrintWorker(
-            self.conn, printer_name, self.selected_file, options, copies
-        )
-        self.worker.progress.connect(lambda m: self.progress_label.setText(m))
-        self.worker.page_printed.connect(
-            lambda n: self.log(f"  ✓ Копия {n} отправлена")
-        )
-        self.worker.finished.connect(self.on_print_finished)
+        self.worker = PrintWorker(self.conn, printer, page_images, options, copies)
+        self.worker.progress.connect(lambda m: self.status_label.setText(m))
+        self.worker.finished.connect(self.on_print_done)
         self.worker.start()
 
-    def on_print_finished(self, success, message):
+    def on_print_done(self, success, msg):
         self.print_btn.setEnabled(True)
-        self.progress_label.setText(message)
-
-        if success:
-            self.log(f"✓ {message}")
-        else:
-            self.log(f"✗ {message}")
-            QMessageBox.critical(self, "Ошибка печати", message)
-
-    def install_drivers(self, target="all"):
-        self.installer = DriverInstaller()
-        self.installer.progress.connect(lambda m: self.driver_progress.setVisible(True))
-        self.installer.output.connect(lambda m: self.driver_output.append(m))
-        self.installer.finished.connect(self.on_driver_install_finished)
-
-        self.driver_output.clear()
-        self.driver_output.append("🔄 Установка драйверов...\n")
-        self.install_hp_btn.setEnabled(False)
-        self.install_epson_btn.setEnabled(False)
-        self.install_all_btn.setEnabled(False)
-
-        self.installer.start()
-
-    def on_driver_install_finished(self, success, message):
-        self.install_hp_btn.setEnabled(True)
-        self.install_epson_btn.setEnabled(True)
-        self.install_all_btn.setEnabled(True)
-        self.driver_progress.setVisible(False)
-
-        self.driver_output.append(f"\n{'='*40}")
-        if success:
-            self.driver_output.append(f"✅ {message}")
-            self.driver_output.append("\n⚠ Перезапустите программу для подключения CUPS.")
-            QMessageBox.information(self, "Готово",
-                "Драйверы установлены!\n\n"
-                "Подключите принтер и перезапустите программу.")
-            self.connect_cups()
-        else:
-            self.driver_output.append(f"❌ {message}")
-            QMessageBox.critical(self, "Ошибка", message)
+        self.status_label.setText(msg)
+        if not success:
+            QMessageBox.critical(self, "Ошибка", msg)
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Print Studio")
-
-    font = QFont()
-    font.setPointSize(10)
-    app.setFont(font)
-
-    window = PrintStudio()
-    window.show()
+    app.setFont(QFont("Sans", 10))
+    w = PrintStudio()
+    w.show()
     sys.exit(app.exec())
 
 
