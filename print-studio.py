@@ -309,7 +309,9 @@ class PageCanvas(QWidget):
             item.crop_l = 0; item.crop_t = 0
             item.crop_r = 1; item.crop_b = 1
             self.item_changed.emit()
-            self.update()
+        if self.cropping:
+            self.cropping = False
+        self.update()
 
     def apply_crop(self):
         if 0 <= self.selected_idx < len(self.items):
@@ -737,7 +739,11 @@ class PrintStudio(QMainWindow):
         self.current_page().apply_crop()
         self._sync_crop_ui()
     def _page_reset_crop(self):
-        self.current_page().reset_crop()
+        page = self.current_page()
+        page.reset_crop()
+        if page.cropping:
+            page.update()
+        self._sync_crop_ui()
 
     def setup_ui(self):
         central = QWidget()
