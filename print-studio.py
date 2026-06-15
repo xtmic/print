@@ -414,9 +414,9 @@ class PageCanvas(QWidget):
             self.drag_start = event.position()
             self.item_start = self.items[idx].copy()
         else:
-            self.selected_idx = -1
-            self.item_selected.emit(None)
-            self.cropping = False
+            if self.selected_idx >= 0:
+                self.selected_idx = -1
+                self.item_selected.emit(None)
         self.update()
 
     def mouseMoveEvent(self, event):
@@ -543,10 +543,10 @@ class PageCanvas(QWidget):
                     rect.height() * (cb - ct))
                 painter.setBrush(QBrush(QColor(0, 0, 0, 100)))
                 painter.setPen(Qt.NoPen)
-                painter.drawRect(page)
-                painter.setCompositionMode(QPainter.CompositionMode_Clear)
-                painter.drawRect(inner)
-                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                overlay = QPainterPath()
+                overlay.addRect(page)
+                overlay.addRect(inner)
+                painter.drawPath(overlay)
                 painter.setPen(QPen(QColor(0, 200, 60), 2, Qt.DashLine))
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRect(inner)
@@ -696,6 +696,7 @@ class PrintStudio(QMainWindow):
 
     def _page_del_item(self):
         self.current_page().delete_selected()
+        self._sync_crop_ui()
     def _page_move_up(self):
         self.current_page().move_selected_up()
     def _page_move_down(self):
@@ -708,8 +709,13 @@ class PrintStudio(QMainWindow):
         self.current_page().flip_selected_h()
     def _page_flip_v(self):
         self.current_page().flip_selected_v()
+    def _sync_crop_ui(self):
+        self.crop_btn.setChecked(self.current_page().cropping)
+        self.apply_crop_btn.setEnabled(self.current_page().cropping)
+
     def _page_apply_crop(self):
         self.current_page().apply_crop()
+        self._sync_crop_ui()
     def _page_reset_crop(self):
         self.current_page().reset_crop()
 
@@ -882,8 +888,7 @@ class PrintStudio(QMainWindow):
         self.stack_layout.addWidget(new); new.show()
         new.item_changed.connect(self._on_item)
         self.page_label.setText(f"{self.page_idx+1} / {len(self.pages)}")
-        self.crop_btn.setChecked(False)
-        self.apply_crop_btn.setEnabled(False)
+        self._sync_crop_ui()
 
     def _prev_page(self):
         if self.page_idx > 0:
