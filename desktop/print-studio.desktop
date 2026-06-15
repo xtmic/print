@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Print Studio
+Comment=GUI программа для печати с гибкими настройками
+Exec=python3 %h/print-studio.py
+Icon=printer
+Terminal=false
+Type=Application
+Categories=Office;Graphics;Printing;
+MimeType=image/png;image/jpeg;image/bmp;image/tiff;application/pdf;
