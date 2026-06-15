@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QThread
 from PySide6.QtGui import (
     QPixmap, QImage, QFont, QPainter, QPen, QBrush, QColor,
+    QPainterPath,
 )
 
 try:
