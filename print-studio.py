@@ -511,7 +511,10 @@ class PageCanvas(QWidget):
                     pil = pil.convert('RGBA')
             except Exception:
                 continue
-            cl, ct, cr, cb = item.crop_rect()
+            if self.cropping and item is self.items[self.selected_idx]:
+                cl, ct, cr, cb = 0.0, 0.0, 1.0, 1.0
+            else:
+                cl, ct, cr, cb = item.crop_rect()
             ow, oh = pil.size
             cx1, cx2 = int(cl * ow), int(cr * ow)
             cy1, cy2 = int(ct * oh), int(cb * oh)
