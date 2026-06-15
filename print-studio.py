@@ -317,12 +317,28 @@ class PageCanvas(QWidget):
             cl, ct, cr, cb = item.crop_rect()
             if cr <= cl or cb <= ct:
                 return
-            cw = item.w * (cr - cl)
-            ch = item.h * (cb - ct)
+            try:
+                pil = Image.open(item.path)
+                ow, oh = pil.size
+                cx1 = int(cl * ow); cx2 = int(cr * ow)
+                cy1 = int(ct * oh); cy2 = int(cb * oh)
+                if cx2 <= cx1 or cy2 <= cy1:
+                    return
+                cropped = pil.crop((cx1, cy1, cx2, cy2))
+                tmpdir = tempfile.mkdtemp(prefix="ps_crop_")
+                out = os.path.join(tmpdir, f"crop_{Path(item.path).stem}.png")
+                cropped.save(out, "PNG")
+                item.path = out
+            except Exception:
+                return
+            pw, ph = self.paper_size_px()
+            scale = item.w / pil.width if pil.width > 0 else 1
+            nw = cropped.width * scale
+            nh = cropped.height * scale
             item.x += item.w * cl
             item.y += item.h * ct
-            item.w = cw
-            item.h = ch
+            item.w = nw
+            item.h = nh
             item.crop_l = 0; item.crop_t = 0
             item.crop_r = 1; item.crop_b = 1
             self.cropping = False
