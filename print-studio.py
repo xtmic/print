@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-Print Studio v2 — GUI c редактором страниц и печатью
+Print Studio v3 — редактор страниц, печать, поддержка PDF/Excel/Word/ODT/изображений
 """
 
 import sys
 import os
 import math
+import shutil
 import tempfile
+import subprocess
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QComboBox, QSpinBox, QCheckBox, QGroupBox,
-    QFileDialog, QMessageBox, QFormLayout, QSlider, QSplitter,
-    QListWidget, QListWidgetItem, QScrollArea, QToolBar, QToolButton,
-    QSizePolicy, QColorDialog
+    QPushButton, QLabel, QComboBox, QSpinBox, QGroupBox,
+    QFileDialog, QMessageBox, QFormLayout, QSplitter,
+    QScrollArea, QSizePolicy, QProgressDialog, QDialog,
+    QDialogButtonBox, QCheckBox
 )
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, Slot, QThread, QTimer
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QThread
 from PySide6.QtGui import (
     QPixmap, QImage, QFont, QPainter, QPen, QBrush, QColor,
-    QTransform, QPainterPath, QImageReader
 )
 
 try:
@@ -30,10 +31,16 @@ except ImportError:
     HAS_CUPS = False
 
 try:
-    from PIL import Image, ImageQt, ImageEnhance
+    from PIL import Image, ImageQt
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
+
+try:
+    import fitz
+    HAS_FITZ = True
+except ImportError:
+    HAS_FITZ = False
 
 PAPER_SIZES = ["A4", "A3", "A5", "Letter", "Legal", "Tabloid", "B5", "C5"]
 PAPER_MM = {
@@ -48,6 +55,144 @@ ORIENTATIONS = {3: "Портрет", 4: "Ландшафт"}
 
 HANDLE_SIZE = 10
 MIN_ITEM_SIZE = 20
+
+IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.gif', '.webp', '.ico', '.ppm', '.pgm'}
+PDF_EXTS = {'.pdf'}
+OFFICE_EXTS = {'.xlsx', '.xls', '.docx', '.doc', '.pptx', '.ppt',
+               '.odt', '.ods', '.odp', '.rtf', '.csv'}
+
+
+class FileConverter(QThread):
+    progress = Signal(str)
+    page_ready = Signal(str)
+    finished = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, filepath):
+        super().__init__()
+        self.filepath = filepath
+
+    def run(self):
+        try:
+            ext = Path(self.filepath).suffix.lower()
+            self.progress.emit(f"Открытие: {Path(self.filepath).name}")
+
+            if ext in IMAGE_EXTS:
+                self.page_ready.emit(self.filepath)
+                self.finished.emit([self.filepath])
+
+            elif ext in PDF_EXTS:
+                pages = self._render_pdf()
+                self.finished.emit(pages)
+
+            elif ext in OFFICE_EXTS:
+                pages = self._render_office()
+                self.finished.emit(pages)
+
+            else:
+                pages = self._render_office()
+                self.finished.emit(pages)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _render_pdf(self):
+        if not HAS_FITZ:
+            self.error.emit("pymupdf не установлен. sudo pacman -S python-pymupdf")
+            return []
+        pages = []
+        doc = fitz.open(self.filepath)
+        tmpdir = tempfile.mkdtemp(prefix="ps_pdf_")
+        for i in range(len(doc)):
+            self.progress.emit(f"PDF страница {i+1}/{len(doc)}...")
+            page = doc.load_page(i)
+            mat = fitz.Matrix(2.0, 2.0)
+            pix = page.get_pixmap(matrix=mat)
+            out = os.path.join(tmpdir, f"pdf_page_{i+1}.png")
+            pix.save(out)
+            pages.append(out)
+        doc.close()
+        return pages
+
+    def _render_office(self):
+        tmpdir = tempfile.mkdtemp(prefix="ps_office_")
+        out_pdf = os.path.join(tmpdir, "converted.pdf")
+        ext = Path(self.filepath).suffix.lower()
+
+        self.progress.emit("Конвертация через LibreOffice...")
+        cmd = [
+            "libreoffice", "--headless", "--convert-to", "pdf",
+            "--outdir", tmpdir, self.filepath
+        ]
+        try:
+            subprocess.run(cmd, timeout=120, capture_output=True, check=True)
+        except FileNotFoundError:
+            self.error.emit("LibreOffice не установлен. sudo pacman -S libreoffice-fresh")
+            return []
+        except subprocess.CalledProcessError as e:
+            if ext == '.csv':
+                return self._render_csv()
+            self.error.emit(f"Ошибка конвертации: {e.stderr.decode()[:200] if e.stderr else str(e)}")
+            return []
+        except subprocess.TimeoutExpired:
+            self.error.emit("Конвертация заняла >120 сек. Файл слишком большой.")
+            return []
+
+        pdf_name = Path(self.filepath).stem + ".pdf"
+        pdf_path = os.path.join(tmpdir, pdf_name)
+        if not os.path.exists(pdf_path):
+            self.error.emit("Не удалось сконвертировать документ.")
+            return []
+
+        if HAS_FITZ:
+            pages = []
+            doc = fitz.open(pdf_path)
+            for i in range(len(doc)):
+                self.progress.emit(f"Страница {i+1}/{len(doc)}...")
+                page = doc.load_page(i)
+                mat = fitz.Matrix(2.0, 2.0)
+                pix = page.get_pixmap(matrix=mat)
+                out = os.path.join(tmpdir, f"page_{i+1}.png")
+                pix.save(out)
+                pages.append(out)
+            doc.close()
+            return pages
+        else:
+            return [pdf_path]
+
+    def _render_csv(self):
+        tmpdir = tempfile.mkdtemp(prefix="ps_csv_")
+        out = os.path.join(tmpdir, "table.png")
+        try:
+            import csv as csvmod
+            with open(self.filepath, 'r') as f:
+                reader = list(csvmod.reader(f))
+            if not reader:
+                return []
+            from PIL import Image, ImageDraw, ImageFont
+            font = ImageFont.load_default()
+            col_w = 120
+            row_h = 24
+            margin = 16
+            ncols = max(len(r) for r in reader)
+            nrows = len(reader)
+            if ncols == 0 or nrows == 0:
+                return []
+            w = ncols * col_w + 2 * margin
+            h = nrows * row_h + 2 * margin
+            img = Image.new('RGB', (max(100, w), max(100, h)), 'white')
+            draw = ImageDraw.Draw(img)
+            for ri, row in enumerate(reader):
+                for ci, cell in enumerate(row):
+                    x = margin + ci * col_w
+                    y = margin + ri * row_h
+                    draw.rectangle([x, y, x + col_w, y + row_h],
+                                   outline='#cccccc', fill='#f8f8f8' if ri == 0 else 'white')
+                    draw.text((x + 4, y + 4), str(cell)[:50], fill='black', font=font)
+            img.save(out)
+            return [out]
+        except Exception:
+            return []
 
 
 @dataclass
@@ -85,14 +230,12 @@ class PageCanvas(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
-
         self.paper = "A4"
         self.items: list[ImageItem] = []
         self.selected_idx = -1
         self.dragging = False
         self.resizing = False
         self.rotating = False
-        self.cropping = False
         self.drag_start = QPointF()
         self.item_start = None
         self.handle_pos = -1
@@ -135,12 +278,7 @@ class PageCanvas(QWidget):
         ppw, pph = self.paper_size_px()
         return (pw / ppw) * page.width(), (ph / pph) * page.height()
 
-    def item_widget_rect(self, item):
-        px, py = self.to_widget_coords(item.x, item.y)
-        pw, ph = self.to_widget_size(item.w, item.h)
-        return QRectF(px, py, pw, ph)
-
-    def add_item(self, path):
+    def add_image_path(self, path):
         pil = Image.open(path)
         w, h = pil.size
         pw, ph = self.paper_size_px()
@@ -155,14 +293,8 @@ class PageCanvas(QWidget):
             s2 = ph * 0.9 / nh
             nw *= s2
             nh *= s2
-        item = ImageItem(
-            path=path,
-            x=(pw - nw) / 2,
-            y=(ph - nh) / 2,
-            w=nw,
-            h=nh,
-            z=len(self.items)
-        )
+        item = ImageItem(path=path, x=(pw - nw) / 2, y=(ph - nh) / 2,
+                         w=nw, h=nh, z=len(self.items))
         self.items.append(item)
         self.selected_idx = len(self.items) - 1
         self.item_changed.emit()
@@ -184,8 +316,7 @@ class PageCanvas(QWidget):
             for it in self.items:
                 if it is not item and it.z >= item.z:
                     it.z -= 1
-            self.item_changed.emit()
-            self.update()
+            self.item_changed.emit(); self.update()
 
     def move_selected_down(self):
         if 0 <= self.selected_idx < len(self.items):
@@ -194,77 +325,54 @@ class PageCanvas(QWidget):
             for it in self.items:
                 if it is not item and it.z <= item.z:
                     it.z += 1
-            self.item_changed.emit()
-            self.update()
+            self.item_changed.emit(); self.update()
 
     def rotate_selected(self, deg):
         if 0 <= self.selected_idx < len(self.items):
             self.items[self.selected_idx].rotation = (self.items[self.selected_idx].rotation + deg) % 360
-            self.item_changed.emit()
-            self.update()
+            self.item_changed.emit(); self.update()
 
     def flip_selected_h(self):
         if 0 <= self.selected_idx < len(self.items):
             item = self.items[self.selected_idx]
             item.crop_l, item.crop_r = item.crop_r, item.crop_l
-            self.item_changed.emit()
-            self.update()
+            self.item_changed.emit(); self.update()
 
     def flip_selected_v(self):
         if 0 <= self.selected_idx < len(self.items):
             item = self.items[self.selected_idx]
             item.crop_t, item.crop_b = item.crop_b, item.crop_t
-            self.item_changed.emit()
-            self.update()
+            self.item_changed.emit(); self.update()
 
     def reset_crop(self):
         if 0 <= self.selected_idx < len(self.items):
             item = self.items[self.selected_idx]
-            item.crop_l = 0
-            item.crop_t = 0
-            item.crop_r = 1
-            item.crop_b = 1
-            r = item.rotation
-            item.rotation = 0
-            pil = Image.open(item.path)
-            nw, nh = item.w, item.h
-            if r in (90, 270):
-                ratio = pil.height / pil.width
-            else:
-                ratio = pil.height / pil.width
-            nh = nw * ratio
-            item.h = nh
-            self.item_changed.emit()
-            self.update()
+            item.crop_l = 0; item.crop_t = 0; item.crop_r = 1; item.crop_b = 1
+            self.item_changed.emit(); self.update()
 
     def find_item_at(self, pos):
         px, py = self.to_page_coords(pos)
-        best = -1
-        best_z = -999999
+        best, best_z = -1, -999999
         for i, item in enumerate(self.items):
             if not item.visible:
                 continue
             if item.x <= px <= item.x + item.w and item.y <= py <= item.y + item.h:
                 if item.z > best_z:
-                    best_z = item.z
-                    best = i
+                    best_z, best = item.z, i
         return best
 
     def get_handles(self, item):
         rect = self.item_widget_rect(item)
         c = rect.center()
-        handles = {
-            0: rect.topLeft(),
-            1: rect.topRight(),
-            2: rect.bottomRight(),
-            3: rect.bottomLeft(),
+        return {
+            0: rect.topLeft(), 1: rect.topRight(),
+            2: rect.bottomRight(), 3: rect.bottomLeft(),
             4: QPointF((rect.left() + rect.right()) / 2, rect.top()),
             5: QPointF((rect.left() + rect.right()) / 2, rect.bottom()),
             6: QPointF(rect.left(), (rect.top() + rect.bottom()) / 2),
             7: QPointF(rect.right(), (rect.top() + rect.bottom()) / 2),
             8: QPointF(c.x(), rect.top() - 30),
         }
-        return handles
 
     def hit_test_handle(self, pos):
         if self.selected_idx < 0:
@@ -276,33 +384,30 @@ class PageCanvas(QWidget):
         return -1
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            h = self.hit_test_handle(event.position())
-            if h >= 0:
-                self.handle_pos = h
-                if h == 8:
-                    self.rotating = True
-                else:
-                    self.resizing = True
-                self.drag_start = event.position()
-                self.item_start = self.items[self.selected_idx].copy()
-                return
-
-            idx = self.find_item_at(event.position())
-            if idx >= 0:
-                self.selected_idx = idx
-                self.item_selected.emit(self.items[idx])
-                self.dragging = True
-                self.drag_start = event.position()
-                self.item_start = self.items[idx].copy()
-            else:
-                self.selected_idx = -1
-                self.item_selected.emit(None)
-            self.update()
+        if event.button() != Qt.LeftButton:
+            return
+        h = self.hit_test_handle(event.position())
+        if h >= 0:
+            self.handle_pos = h
+            self.rotating = (h == 8)
+            self.resizing = (h != 8)
+            self.drag_start = event.position()
+            self.item_start = self.items[self.selected_idx].copy()
+            return
+        idx = self.find_item_at(event.position())
+        if idx >= 0:
+            self.selected_idx = idx
+            self.item_selected.emit(self.items[idx])
+            self.dragging = True
+            self.drag_start = event.position()
+            self.item_start = self.items[idx].copy()
+        else:
+            self.selected_idx = -1
+            self.item_selected.emit(None)
+        self.update()
 
     def mouseMoveEvent(self, event):
         pos = event.position()
-
         if self.dragging and self.item_start:
             page = self.page_rect()
             pw, ph = self.paper_size_px()
@@ -311,56 +416,38 @@ class PageCanvas(QWidget):
             item = self.items[self.selected_idx]
             item.x = max(0, min(pw - item.w, self.item_start.x + dx))
             item.y = max(0, min(ph - item.h, self.item_start.y + dy))
-            self.item_changed.emit()
-            self.update()
-
+            self.item_changed.emit(); self.update()
         elif self.resizing and self.item_start:
             px, py = self.to_page_coords(pos)
             item = self.items[self.selected_idx]
             start = self.item_start
-
             if self.handle_pos in (0, 3, 6):
                 nx = min(px, start.x + start.w - MIN_ITEM_SIZE)
-                nw = start.x + start.w - nx
                 item.x = max(0, nx)
-                item.w = max(MIN_ITEM_SIZE, nw)
+                item.w = max(MIN_ITEM_SIZE, start.x + start.w - nx)
             elif self.handle_pos in (1, 2, 7):
                 item.w = max(MIN_ITEM_SIZE, px - start.x)
             if self.handle_pos in (0, 1, 4):
                 ny = min(py, start.y + start.h - MIN_ITEM_SIZE)
-                nh2 = start.y + start.h - ny
                 item.y = max(0, ny)
-                item.h = max(MIN_ITEM_SIZE, nh2)
+                item.h = max(MIN_ITEM_SIZE, start.y + start.h - ny)
             elif self.handle_pos in (2, 3, 5):
                 item.h = max(MIN_ITEM_SIZE, py - start.y)
-
-            self.item_changed.emit()
-            self.update()
-
+            self.item_changed.emit(); self.update()
         elif self.rotating and self.item_start:
             cw, cy = self.to_widget_coords(
                 self.items[self.selected_idx].x + self.items[self.selected_idx].w / 2,
-                self.items[self.selected_idx].y + self.items[self.selected_idx].h / 2
-            )
+                self.items[self.selected_idx].y + self.items[self.selected_idx].h / 2)
             item = self.items[self.selected_idx]
-            angle = math.degrees(math.atan2(pos.x() - cw, - (pos.y() - cy)))
-            item.rotation = angle
-            self.item_changed.emit()
-            self.update()
-
+            item.rotation = math.degrees(math.atan2(pos.x() - cw, -(pos.y() - cy)))
+            self.item_changed.emit(); self.update()
         else:
             self.hover_handle = self.hit_test_handle(pos)
-            if self.hover_handle >= 0 or self.find_item_at(pos) >= 0:
-                self.setCursor(Qt.OpenHandCursor if self.hover_handle < 0 else Qt.CrossCursor)
-            else:
-                self.setCursor(Qt.ArrowCursor)
+            self.setCursor(Qt.OpenHandCursor if self.hover_handle >= 0 or self.find_item_at(pos) >= 0 else Qt.ArrowCursor)
 
     def mouseReleaseEvent(self, event):
-        self.dragging = False
-        self.resizing = False
-        self.rotating = False
-        self.item_start = None
-        self.handle_pos = -1
+        self.dragging = self.resizing = self.rotating = False
+        self.item_start = None; self.handle_pos = -1
         self.setCursor(Qt.ArrowCursor)
 
     def wheelEvent(self, event):
@@ -368,86 +455,57 @@ class PageCanvas(QWidget):
             delta = event.angleDelta().y() / 120.0
             item = self.items[self.selected_idx]
             scale = 1.0 + delta * 0.05
-            cx = item.x + item.w / 2
-            cy = item.y + item.h / 2
-            item.w *= scale
-            item.h *= scale
-            item.x = cx - item.w / 2
-            item.y = cy - item.h / 2
-            self.item_changed.emit()
-            self.update()
-
-    def draw_page_bg(self, painter):
-        page = self.page_rect()
-        painter.setPen(QPen(QColor(100, 100, 100), 2))
-        painter.setBrush(QBrush(self.bg_color))
-        painter.drawRect(page)
-
-    def load_pil_image(self, item):
-        try:
-            img = Image.open(item.path)
-            if img.mode == 'RGBA':
-                bg = Image.new('RGBA', img.size, (255, 255, 255, 255))
-                img = Image.alpha_composite(bg, img)
-            elif img.mode != 'RGB' and img.mode != 'RGBA':
-                img = img.convert('RGBA')
-            return img
-        except Exception:
-            return None
+            cx, cy = item.x + item.w / 2, item.y + item.h / 2
+            item.w *= scale; item.h *= scale
+            item.x = cx - item.w / 2; item.y = cy - item.h / 2
+            self.item_changed.emit(); self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
-
         page = self.page_rect()
-        self.draw_page_bg(painter)
+        painter.setPen(QPen(QColor(100, 100, 100), 2))
+        painter.setBrush(QBrush(self.bg_color))
+        painter.drawRect(page)
         painter.setClipRect(page)
-
         sorted_items = sorted(self.items, key=lambda it: it.z)
-
-        for i, item in enumerate(sorted_items):
+        for item in sorted_items:
             if not item.visible or not HAS_PIL:
                 continue
-
-            pil = self.load_pil_image(item)
-            if pil is None:
+            try:
+                pil = Image.open(item.path)
+                if pil.mode == 'RGBA':
+                    bg = Image.new('RGBA', pil.size, (255, 255, 255, 255))
+                    pil = Image.alpha_composite(bg, pil)
+                elif pil.mode != 'RGB' and pil.mode != 'RGBA':
+                    pil = pil.convert('RGBA')
+            except Exception:
                 continue
-
             cl, ct, cr, cb = item.crop_rect()
             ow, oh = pil.size
-            cx1 = int(cl * ow)
-            cy1 = int(ct * oh)
-            cx2 = int(cr * ow)
-            cy2 = int(cb * oh)
+            cx1, cy1 = int(cl * ow), int(ct * oh)
+            cx2, cy2 = int(cr * ow), int(cb * oh)
             if cx2 <= cx1 or cy2 <= cy1:
                 continue
             cropped = pil.crop((cx1, cy1, cx2, cy2))
-
             qimg = ImageQt.ImageQt(cropped)
             pixmap = QPixmap.fromImage(qimg)
-
             rect = self.item_widget_rect(item)
             painter.save()
             painter.translate(rect.center())
-
             if item.rotation != 0:
                 painter.rotate(item.rotation)
-
             target = QRectF(-rect.width() / 2, -rect.height() / 2,
                             rect.width(), rect.height())
             painter.drawPixmap(target.toRect(), pixmap)
-
             if item is self.items[self.selected_idx]:
                 painter.setPen(QPen(QColor(0, 120, 255), 2, Qt.DashLine))
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRect(target)
-
             painter.restore()
-
         painter.setClipRect(QRectF(0, 0, self.width(), self.height()))
-
-        if self.selected_idx >= 0 and self.selected_idx < len(self.items):
+        if 0 <= self.selected_idx < len(self.items):
             item = self.items[self.selected_idx]
             handles = self.get_handles(item)
             for idx, pt in handles.items():
@@ -459,7 +517,6 @@ class PageCanvas(QWidget):
                 painter.setBrush(QBrush(QColor(0, 120, 255)))
                 painter.setPen(QPen(Qt.white, 1))
                 painter.drawRect(QRectF(pt.x() - 5, pt.y() - 5, 10, 10))
-
         painter.end()
 
     def page_to_image(self):
@@ -468,32 +525,31 @@ class PageCanvas(QWidget):
         pw, ph = self.paper_size_px()
         img = Image.new('RGB', (int(pw), int(ph)),
                         (self.bg_color.red(), self.bg_color.green(), self.bg_color.blue()))
-        sorted_items = sorted(self.items, key=lambda it: it.z)
-        for item in sorted_items:
+        for item in sorted(self.items, key=lambda it: it.z):
             if not item.visible:
                 continue
-            pil = self.load_pil_image(item)
-            if pil is None:
+            try:
+                pil = Image.open(item.path)
+            except Exception:
                 continue
             cl, ct, cr, cb = item.crop_rect()
             ow, oh = pil.size
-            cx1 = max(0, int(cl * ow))
-            cy1 = max(0, int(ct * oh))
-            cx2 = min(ow, int(cr * ow))
-            cy2 = min(oh, int(cb * oh))
+            cx1, cy1 = max(0, int(cl * ow)), max(0, int(ct * oh))
+            cx2, cy2 = min(ow, int(cr * ow)), min(oh, int(cb * oh))
             if cx2 <= cx1 or cy2 <= cy1:
                 continue
             cropped = pil.crop((cx1, cy1, cx2, cy2))
             cropped = cropped.resize((max(1, int(item.w)), max(1, int(item.h))),
                                      Image.LANCZOS)
             if item.rotation != 0:
-                cropped = cropped.rotate(item.rotation, expand=True, resample=Image.BICUBIC,
+                cropped = cropped.rotate(item.rotation, expand=True,
+                                        resample=Image.BICUBIC,
                                         fillcolor=(255, 255, 255, 0))
+            paste_pos = (max(0, int(item.x)), max(0, int(item.y)))
             if cropped.mode == 'RGBA':
-                mask = cropped.split()[3]
-                img.paste(cropped, (max(0, int(item.x)), max(0, int(item.y))), mask)
+                img.paste(cropped, paste_pos, cropped.split()[3])
             else:
-                img.paste(cropped, (max(0, int(item.x)), max(0, int(item.y))))
+                img.paste(cropped, paste_pos)
         return img
 
     def clear_page(self):
@@ -518,21 +574,17 @@ class PrintWorker(QThread):
 
     def run(self):
         try:
-            tmpdir = tempfile.mkdtemp(prefix="printstudio_")
+            tmpdir = tempfile.mkdtemp(prefix="ps_out_")
             files = []
             for i, img in enumerate(self.page_images):
                 fpath = os.path.join(tmpdir, f"page_{i+1}.png")
                 img.save(fpath, "PNG")
                 files.append(fpath)
-
             for ci in range(self.copies):
                 self.progress.emit(f"Копия {ci+1}/{self.copies}...")
                 for fi, fpath in enumerate(files):
-                    self.conn.printFile(
-                        self.printer_name, fpath,
-                        f"page_{fi+1}", self.options
-                    )
-
+                    self.conn.printFile(self.printer_name, fpath,
+                                        f"page_{fi+1}", self.options)
             for f in files:
                 os.unlink(f)
             os.rmdir(tmpdir)
@@ -541,15 +593,46 @@ class PrintWorker(QThread):
             self.finished.emit(False, str(e))
 
 
+class ImportDialog(QDialog):
+    def __init__(self, num_pages, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Импорт страниц")
+        self.result_pages = []
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"Документ содержит {num_pages} стр."))
+        self.all_pages = QCheckBox("Все страницы (новые)")
+        self.all_pages.setChecked(True)
+        layout.addWidget(self.all_pages)
+        self.first_page = QCheckBox("Только первую на текущую")
+        layout.addWidget(self.first_page)
+        self.all_to_current = QCheckBox("Все на текущую страницу")
+        layout.addWidget(self.all_to_current)
+        self.all_pages.toggled.connect(lambda: self.first_page.setChecked(False) or self.all_to_current.setChecked(False))
+        self.first_page.toggled.connect(lambda: self.all_pages.setChecked(False) or self.all_to_current.setChecked(False))
+        self.all_to_current.toggled.connect(lambda: self.all_pages.setChecked(False) or self.first_page.setChecked(False))
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def mode(self):
+        if self.first_page.isChecked():
+            return "first"
+        if self.all_to_current.isChecked():
+            return "all_current"
+        return "all"
+
+
 class PrintStudio(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Print Studio v2")
+        self.setWindowTitle("Print Studio v3")
         self.setMinimumSize(1100, 750)
         self.conn = None
         self.printer_attrs = {}
         self.page_idx = 0
         self.pages = [PageCanvas()]
+        self.converter = None
 
         self.setup_ui()
         self.connect_cups()
@@ -564,25 +647,24 @@ class PrintStudio(QMainWindow):
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # === ЛЕВАЯ ПАНЕЛЬ ===
         left_panel = QWidget()
         left_panel.setMaximumWidth(360)
         left = QVBoxLayout(left_panel)
         left.setContentsMargins(8, 8, 8, 8)
 
         # Файлы
-        files_grp = QGroupBox("Изображения")
+        files_grp = QGroupBox("Файлы")
         fl = QVBoxLayout(files_grp)
         btn_row = QHBoxLayout()
         self.add_btn = QPushButton("Добавить")
-        self.add_btn.clicked.connect(self.add_image)
+        self.add_btn.clicked.connect(self.add_file)
         self.add_multi_btn = QPushButton("+Несколько")
-        self.add_multi_btn.clicked.connect(self.add_images)
+        self.add_multi_btn.clicked.connect(self.add_files)
         btn_row.addWidget(self.add_btn)
         btn_row.addWidget(self.add_multi_btn)
         fl.addLayout(btn_row)
         self.delete_img_btn = QPushButton("Удалить")
-        self.delete_img_btn.clicked.connect(self.current_page().delete_selected)
+        self.delete_img_btn.clicked.connect(lambda: self.current_page().delete_selected())
         fl.addWidget(self.delete_img_btn)
         left.addWidget(files_grp)
 
@@ -591,30 +673,27 @@ class PrintStudio(QMainWindow):
         ll = QVBoxLayout(layer_grp)
         lr1 = QHBoxLayout()
         self.up_btn = QPushButton("▲")
-        self.up_btn.clicked.connect(self.current_page().move_selected_up)
+        self.up_btn.clicked.connect(lambda: self.current_page().move_selected_up())
         self.down_btn = QPushButton("▼")
-        self.down_btn.clicked.connect(self.current_page().move_selected_down)
-        lr1.addWidget(self.up_btn)
-        lr1.addWidget(self.down_btn)
+        self.down_btn.clicked.connect(lambda: self.current_page().move_selected_down())
+        lr1.addWidget(self.up_btn); lr1.addWidget(self.down_btn)
         ll.addLayout(lr1)
         lr2 = QHBoxLayout()
         self.rot_l_btn = QPushButton("↺ -90")
         self.rot_l_btn.clicked.connect(lambda: self.current_page().rotate_selected(-90))
         self.rot_r_btn = QPushButton("↻ +90")
         self.rot_r_btn.clicked.connect(lambda: self.current_page().rotate_selected(90))
-        lr2.addWidget(self.rot_l_btn)
-        lr2.addWidget(self.rot_r_btn)
+        lr2.addWidget(self.rot_l_btn); lr2.addWidget(self.rot_r_btn)
         ll.addLayout(lr2)
         lr3 = QHBoxLayout()
         self.flip_h_btn = QPushButton("↔ Гор.")
-        self.flip_h_btn.clicked.connect(self.current_page().flip_selected_h)
+        self.flip_h_btn.clicked.connect(lambda: self.current_page().flip_selected_h())
         self.flip_v_btn = QPushButton("↕ Верт.")
-        self.flip_v_btn.clicked.connect(self.current_page().flip_selected_v)
-        lr3.addWidget(self.flip_h_btn)
-        lr3.addWidget(self.flip_v_btn)
+        self.flip_v_btn.clicked.connect(lambda: self.current_page().flip_selected_v())
+        lr3.addWidget(self.flip_h_btn); lr3.addWidget(self.flip_v_btn)
         ll.addLayout(lr3)
         self.reset_crop_btn = QPushButton("Сброс обрезки")
-        self.reset_crop_btn.clicked.connect(self.current_page().reset_crop)
+        self.reset_crop_btn.clicked.connect(lambda: self.current_page().reset_crop())
         ll.addWidget(self.reset_crop_btn)
         left.addWidget(layer_grp)
 
@@ -628,17 +707,14 @@ class PrintStudio(QMainWindow):
         self.page_label.setAlignment(Qt.AlignCenter)
         self.next_btn = QPushButton("▶")
         self.next_btn.clicked.connect(self.next_page)
-        pg_nav.addWidget(self.prev_btn)
-        pg_nav.addWidget(self.page_label)
-        pg_nav.addWidget(self.next_btn)
+        pg_nav.addWidget(self.prev_btn); pg_nav.addWidget(self.page_label); pg_nav.addWidget(self.next_btn)
         pl.addLayout(pg_nav)
         pg_nav2 = QHBoxLayout()
         self.add_page_btn = QPushButton("+ Страница")
         self.add_page_btn.clicked.connect(self.add_page)
         self.del_page_btn = QPushButton("− Страница")
         self.del_page_btn.clicked.connect(self.delete_page)
-        pg_nav2.addWidget(self.add_page_btn)
-        pg_nav2.addWidget(self.del_page_btn)
+        pg_nav2.addWidget(self.add_page_btn); pg_nav2.addWidget(self.del_page_btn)
         pl.addLayout(pg_nav2)
         self.dup_page_btn = QPushButton("Копировать страницу")
         self.dup_page_btn.clicked.connect(self.duplicate_page)
@@ -652,47 +728,38 @@ class PrintStudio(QMainWindow):
         self.printer_combo = QComboBox()
         self.refresh_btn = QPushButton("↻")
         self.refresh_btn.clicked.connect(self.refresh_printers)
-        prr.addWidget(self.printer_combo, 1)
-        prr.addWidget(self.refresh_btn)
+        prr.addWidget(self.printer_combo, 1); prr.addWidget(self.refresh_btn)
         prl.addLayout(prr)
         left.addWidget(printer_grp)
 
         # Настройки
         set_grp = QGroupBox("Печать")
         sl = QFormLayout(set_grp)
-        self.copies_spin = QSpinBox()
-        self.copies_spin.setRange(1, 999)
-        self.copies_spin.setValue(1)
+        self.copies_spin = QSpinBox(); self.copies_spin.setRange(1, 999); self.copies_spin.setValue(1)
         sl.addRow("Копии:", self.copies_spin)
-
         self.orient_combo = QComboBox()
         for k, v in ORIENTATIONS.items():
             self.orient_combo.addItem(v, k)
         sl.addRow("Ориентация:", self.orient_combo)
-
         self.paper_combo = QComboBox()
         self.paper_combo.addItems(PAPER_SIZES)
         self.paper_combo.setCurrentText("A4")
         self.paper_combo.currentTextChanged.connect(self.on_paper_changed)
         sl.addRow("Бумага:", self.paper_combo)
-
         self.color_combo = QComboBox()
         for k, v in COLOR_MODES.items():
             self.color_combo.addItem(v, k)
         sl.addRow("Цвет:", self.color_combo)
-
         self.qual_combo = QComboBox()
         for k, v in QUALITY_PRESETS.items():
             self.qual_combo.addItem(v, k)
         sl.addRow("Качество:", self.qual_combo)
-
         self.dup_combo = QComboBox()
         for k, v in DUPLEX_MODES.items():
             self.dup_combo.addItem(v, k)
         sl.addRow("Дуплекс:", self.dup_combo)
         left.addWidget(set_grp)
 
-        # Кнопка печати
         self.print_btn = QPushButton("🖨  Напечатать")
         self.print_btn.setMinimumHeight(48)
         self.print_btn.setStyleSheet("""
@@ -703,19 +770,16 @@ class PrintStudio(QMainWindow):
         """)
         self.print_btn.clicked.connect(self.print_document)
         left.addWidget(self.print_btn)
-
-        self.status_label = QLabel("")
+        self.status_label = QLabel("Готов. Добавьте файлы (изображения, PDF, Excel, Word...).")
+        self.status_label.setWordWrap(True)
         left.addWidget(self.status_label)
-
         left.addStretch()
 
-        # === ПРАВАЯ ЧАСТЬ: холст ===
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         self.page_stack = QWidget()
         self.page_stack_layout = QVBoxLayout(self.page_stack)
         self.page_stack_layout.setContentsMargins(0, 0, 0, 0)
-
         self.page_stack_layout.addWidget(self.current_page())
         scroll.setWidget(self.page_stack)
 
@@ -736,14 +800,11 @@ class PrintStudio(QMainWindow):
         if idx == self.page_idx:
             return
         old = self.current_page()
-        self.page_stack_layout.removeWidget(old)
-        old.hide()
+        self.page_stack_layout.removeWidget(old); old.hide()
         old.item_changed.disconnect()
-
         self.page_idx = idx
         new_page = self.current_page()
-        self.page_stack_layout.addWidget(new_page)
-        new_page.show()
+        self.page_stack_layout.addWidget(new_page); new_page.show()
         new_page.item_changed.connect(self.on_item_changed)
         self.page_label.setText(f"{self.page_idx + 1} / {len(self.pages)}")
 
@@ -771,37 +832,101 @@ class PrintStudio(QMainWindow):
         del self.pages[self.page_idx]
         self.page_idx = min(self.page_idx, len(self.pages) - 1)
         new_page = self.current_page()
-        self.page_stack_layout.addWidget(new_page)
-        new_page.show()
+        self.page_stack_layout.addWidget(new_page); new_page.show()
         new_page.item_changed.connect(self.on_item_changed)
         self.page_label.setText(f"{self.page_idx + 1} / {len(self.pages)}")
 
     def duplicate_page(self):
         src = self.current_page()
         p = PageCanvas()
-        p.paper = src.paper
-        p.bg_color = src.bg_color
+        p.paper = src.paper; p.bg_color = src.bg_color
         p.items = [it.copy() for it in src.items]
         p.item_changed.connect(self.on_item_changed)
         self.pages.append(p)
         self.switch_page(len(self.pages) - 1)
         self.page_label.setText(f"{self.page_idx + 1} / {len(self.pages)}")
 
-    def add_image(self):
+    def add_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите изображение", "",
-            "Изображения (*.png *.jpg *.jpeg *.bmp *.tiff *.gif *.webp);;Все (*)"
+            self, "Выберите файл", "",
+            "Все поддерживаемые (*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.gif *.webp "
+            "*.pdf *.xlsx *.xls *.docx *.doc *.pptx *.ppt *.odt *.ods *.odp *.rtf *.csv);;"
+            "Изображения (*.png *.jpg *.jpeg *.bmp *.tiff *.gif *.webp);;"
+            "PDF (*.pdf);;"
+            "Документы Office (*.xlsx *.xls *.docx *.doc *.pptx *.ppt *.odt *.ods *.odp *.rtf *.csv);;"
+            "Все файлы (*)"
         )
         if path:
-            self.current_page().add_item(path)
+            self._import_file(path)
 
-    def add_images(self):
+    def add_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Выберите изображения", "",
-            "Изображения (*.png *.jpg *.jpeg *.bmp *.tiff *.gif *.webp);;Все (*)"
+            self, "Выберите файлы", "",
+            "Все поддерживаемые (*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.gif *.webp "
+            "*.pdf *.xlsx *.xls *.docx *.doc *.pptx *.ppt *.odt *.ods *.odp *.rtf *.csv);;"
+            "Изображения (*.png *.jpg *.jpeg *.bmp *.tiff *.gif *.webp);;"
+            "PDF (*.pdf);;"
+            "Документы Office (*.xlsx *.xls *.docx *.doc *.pptx *.ppt *.odt *.ods *.odp *.rtf *.csv);;"
+            "Все файлы (*)"
         )
         for path in paths:
-            self.current_page().add_item(path)
+            self._import_file(path)
+
+    def _import_file(self, path):
+        ext = Path(path).suffix.lower()
+        self.status_label.setText(f"Открытие: {Path(path).name}")
+
+        if ext in IMAGE_EXTS:
+            self.current_page().add_image_path(path)
+            self.status_label.setText(f"Добавлено: {Path(path).name}")
+            return
+
+        self.progress_dlg = QProgressDialog("Конвертация...", None, 0, 0, self)
+        self.progress_dlg.setWindowModality(Qt.WindowModal)
+        self.progress_dlg.setCancelButton(None)
+        self.progress_dlg.show()
+
+        self.converter = FileConverter(path)
+        self.converter.progress.connect(self.progress_dlg.setLabelText)
+        self.converter.finished.connect(lambda pages: self._on_import_done(path, pages))
+        self.converter.error.connect(self._on_import_error)
+        self.converter.start()
+
+    def _on_import_done(self, path, pages):
+        self.progress_dlg.close()
+        if not pages:
+            self.status_label.setText(f"Не удалось: {Path(path).name}")
+            return
+
+        num_pages = len(pages)
+        if num_pages == 1:
+            self.current_page().add_image_path(pages[0])
+            self.status_label.setText(f"Добавлено: {Path(path).name}")
+            return
+
+        dlg = ImportDialog(num_pages, self)
+        if dlg.exec() == QDialog.Rejected:
+            return
+
+        mode = dlg.mode()
+        page = self.current_page()
+        if mode == "first":
+            page.add_image_path(pages[0])
+        elif mode == "all_current":
+            for p in pages:
+                page.add_image_path(p)
+        else:
+            page.add_image_path(pages[0])
+            for p in pages[1:]:
+                new_page = self.add_page()
+                self.current_page().add_image_path(p)
+
+        self.status_label.setText(f"Импортировано: {Path(path).name} ({num_pages} стр.)")
+
+    def _on_import_error(self, msg):
+        self.progress_dlg.close()
+        QMessageBox.warning(self, "Ошибка импорта", msg)
+        self.status_label.setText(f"Ошибка: {msg[:80]}")
 
     def connect_cups(self):
         if HAS_CUPS:
@@ -858,10 +983,11 @@ class PrintStudio(QMainWindow):
         QApplication.processEvents()
 
         page_images = []
-        for i, page in enumerate(self.pages):
+        for page in self.pages:
             img = page.page_to_image()
             if img is None:
-                QMessageBox.critical(self, "Ошибка", "Pillow не установлен. pip install Pillow")
+                QMessageBox.critical(self, "Ошибка",
+                    "Pillow не установлен. pip install Pillow")
                 return
             page_images.append(img)
 
