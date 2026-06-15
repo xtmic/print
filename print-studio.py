@@ -694,6 +694,25 @@ class PrintStudio(QMainWindow):
     def _on_item(self):
         pass
 
+    def _page_del_item(self):
+        self.current_page().delete_selected()
+    def _page_move_up(self):
+        self.current_page().move_selected_up()
+    def _page_move_down(self):
+        self.current_page().move_selected_down()
+    def _page_rot_ccw(self):
+        self.current_page().rotate_selected(-90)
+    def _page_rot_cw(self):
+        self.current_page().rotate_selected(90)
+    def _page_flip_h(self):
+        self.current_page().flip_selected_h()
+    def _page_flip_v(self):
+        self.current_page().flip_selected_v()
+    def _page_apply_crop(self):
+        self.current_page().apply_crop()
+    def _page_reset_crop(self):
+        self.current_page().reset_crop()
+
     def setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -719,25 +738,25 @@ class PrintStudio(QMainWindow):
         r.addWidget(self.add_btn); r.addWidget(self.add_multi_btn)
         gl.addLayout(r)
         self.del_btn = QPushButton("Удалить")
-        self.del_btn.clicked.connect(lambda: self.current_page().delete_selected())
+        self.del_btn.clicked.connect(self._page_del_item)
         gl.addWidget(self.del_btn)
         lo.addWidget(g)
 
         g = QGroupBox("Слой")
         gl = QVBoxLayout(g); gl.setSpacing(4)
         r = QHBoxLayout()
-        self.up_btn = QPushButton("▲"); self.up_btn.clicked.connect(lambda: self.current_page().move_selected_up())
-        self.down_btn = QPushButton("▼"); self.down_btn.clicked.connect(lambda: self.current_page().move_selected_down())
+        self.up_btn = QPushButton("▲"); self.up_btn.clicked.connect(self._page_move_up)
+        self.down_btn = QPushButton("▼"); self.down_btn.clicked.connect(self._page_move_down)
         r.addWidget(self.up_btn); r.addWidget(self.down_btn)
         gl.addLayout(r)
         r = QHBoxLayout()
-        self.rot_l = QPushButton("↺ -90"); self.rot_l.clicked.connect(lambda: self.current_page().rotate_selected(-90))
-        self.rot_r = QPushButton("↻ +90"); self.rot_r.clicked.connect(lambda: self.current_page().rotate_selected(90))
+        self.rot_l = QPushButton("↺ -90"); self.rot_l.clicked.connect(self._page_rot_ccw)
+        self.rot_r = QPushButton("↻ +90"); self.rot_r.clicked.connect(self._page_rot_cw)
         r.addWidget(self.rot_l); r.addWidget(self.rot_r)
         gl.addLayout(r)
         r = QHBoxLayout()
-        self.flip_h = QPushButton("↔ Гор."); self.flip_h.clicked.connect(lambda: self.current_page().flip_selected_h())
-        self.flip_v = QPushButton("↕ Верт."); self.flip_v.clicked.connect(lambda: self.current_page().flip_selected_v())
+        self.flip_h = QPushButton("↔ Гор."); self.flip_h.clicked.connect(self._page_flip_h)
+        self.flip_v = QPushButton("↕ Верт."); self.flip_v.clicked.connect(self._page_flip_v)
         r.addWidget(self.flip_h); r.addWidget(self.flip_v)
         gl.addLayout(r)
 
@@ -746,14 +765,14 @@ class PrintStudio(QMainWindow):
         self.crop_btn.setCheckable(True)
         self.crop_btn.clicked.connect(self._toggle_crop)
         self.apply_crop_btn = QPushButton("Применить")
-        self.apply_crop_btn.clicked.connect(lambda: self.current_page().apply_crop())
+        self.apply_crop_btn.clicked.connect(self._page_apply_crop)
         self.apply_crop_btn.setEnabled(False)
         self.apply_crop_btn.setStyleSheet("QPushButton:enabled{background:#e8f5e9;font-weight:bold}")
         r.addWidget(self.crop_btn); r.addWidget(self.apply_crop_btn)
         gl.addLayout(r)
 
         self.reset_crop_btn = QPushButton("Сброс обрезки")
-        self.reset_crop_btn.clicked.connect(lambda: self.current_page().reset_crop())
+        self.reset_crop_btn.clicked.connect(self._page_reset_crop)
         gl.addWidget(self.reset_crop_btn)
         lo.addWidget(g)
 
